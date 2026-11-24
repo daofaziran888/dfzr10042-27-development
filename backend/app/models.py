@@ -49,6 +49,32 @@ class ExperimentStatus(str, Enum):
     TERMINATED = "terminated"
 
 
+class ComparisonEligibilityBasis(str, Enum):
+    """报告取数时判定样本资格的时点。
+
+    CLAIM   —— 领取时确定资格，之后撤回也按已领快照出件（已领范围与撤回范围冲突时保留已领值）。
+    CONFIRM —— 报告确认前再验证，撤回立即从本期报告剔除。
+    """
+
+    CLAIM = "claim"
+    CONFIRM = "confirm"
+
+    @classmethod
+    def normalize(cls, value: "ComparisonEligibilityBasis | str | None") -> "ComparisonEligibilityBasis":
+        if isinstance(value, cls):
+            return value
+        if value in (None, ""):
+            return cls.CONFIRM
+        text = str(value).strip().casefold()
+        claim_aliases = {"claim", "领取", "领取时确定", "领取时确定资格", "snapshot", "claimed"}
+        confirm_aliases = {"confirm", "确认", "报告确认前再验证", "再验证", "revalidate", "latest"}
+        if text in claim_aliases:
+            return cls.CLAIM
+        if text in confirm_aliases:
+            return cls.CONFIRM
+        raise ValueError(f"未知的资格判定时点：{value}")
+
+
 class AttributionAlgorithm(str, Enum):
     FIRST_TOUCH = "first_touch"
     LAST_TOUCH = "last_touch"
@@ -465,6 +491,263 @@ class ExperimentResult:
         if self.control_mean > 0:
             self.lift = round((self.treatment_mean - self.control_mean) / self.control_mean, 4)
         return self
+
+
+# ============================================================
+# 对比撤回有效范围
+# ============================================================
+
+@dataclass(frozen=True)
+class ExperimentObservation:
+    """实验的一次已完成观察（源数据）。
+
+    观察值是源数据，撤回不会删除或改写它；撤回只通过
+    :class:`ComparisonWithdrawScope` 决定某一份报告还能不能取到它。
+    """
+
+    observation_id: str
+    comparison_id: str
+    experiment_id: str
+    group: str
+    value: float
+    collected_at: str = ""
+    source: str = "实验平台"
+    status: str = "已完成"
+    note: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "observation_id": self.observation_id,
+            "comparison_id": self.comparison_id,
+            "experiment_id": self.experiment_id,
+            "group": self.group,
+            "value": self.value,
+            "collected_at": self.collected_at,
+            "source": self.source,
+            "status": self.status,
+            "note": self.note,
+        }
+
+
+@dataclass(frozen=True)
+class WithdrawScopeTransition:
+    """撤回范围的状态流转记录，用来对回报告实算样本和发布凭证。"""
+
+    sequence: int
+    from_status: str
+    to_status: str
+    at: str
+    actor: str
+    reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "sequence": self.sequence,
+            "from_status": self.from_status,
+            "to_status": self.to_status,
+            "at": self.at,
+            "actor": self.actor,
+            "reason": self.reason,
+        }
+
+
+@dataclass
+class ComparisonWithdrawScope:
+    """对比撤回有效范围：某实验组里不允许后续报告再取用的观察集合。
+
+    状态只有「生效」和「已撤销」两种。生效范围会被报告计算读取：
+    未领取的报告直接剔除范围内的观察；已领取的报告按领取时的资格
+    判定时点决定是否保留快照。每次出件都会把口径决定、报告编号和
+    发布凭证回写到 ``reconciliations``，保证撤回流转可追溯。
+    """
+
+    scope_id: str
+    comparison_id: str
+    experiment_id: str
+    group: str
+    observation_ids: tuple[str, ...]
+    status: str = "生效"
+    opened_at: str = ""
+    actor: str = "对比负责人"
+    reason: str = ""
+    claim_id: str = ""
+    sequence: int = 0
+    entry_id: int = 0
+    transitions: list[WithdrawScopeTransition] = field(default_factory=list)
+    reconciliations: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def active(self) -> bool:
+        return self.status == "生效"
+
+    @property
+    def report_ids(self) -> list[str]:
+        return [item["report_id"] for item in self.reconciliations]
+
+    @property
+    def credential_ids(self) -> list[str]:
+        return [item["credential_id"] for item in self.reconciliations]
+
+    def covers(self, observation_id: str) -> bool:
+        return observation_id in self.observation_ids
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "scope_id": self.scope_id,
+            "comparison_id": self.comparison_id,
+            "experiment_id": self.experiment_id,
+            "group": self.group,
+            "observation_ids": list(self.observation_ids),
+            "status": self.status,
+            "active": self.active,
+            "opened_at": self.opened_at,
+            "actor": self.actor,
+            "reason": self.reason,
+            "claim_id": self.claim_id,
+            "sequence": self.sequence,
+            "entry_id": self.entry_id,
+            "transitions": [item.to_dict() for item in self.transitions],
+            "reconciliations": [dict(item) for item in self.reconciliations],
+            "report_ids": self.report_ids,
+            "credential_ids": self.credential_ids,
+        }
+
+
+@dataclass
+class ComparisonClaim:
+    """报告领取记录：领取时冻结的观察范围，用于冲突时判定资格。"""
+
+    claim_id: str
+    comparison_id: str
+    report_period: str
+    basis: ComparisonEligibilityBasis
+    groups: tuple[str, ...]
+    observation_ids: tuple[str, ...]
+    group_totals: dict[str, float]
+    claimed_total: float
+    claimed_at: str = ""
+    sequence: int = 0
+    status: str = "已领取"
+    revalidated: bool = False
+    conflict: bool = False
+    conflict_note: str = ""
+    delivered_report_id: str = ""
+    delivered_credential_id: str = ""
+    delivered_total: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "claim_id": self.claim_id,
+            "comparison_id": self.comparison_id,
+            "report_period": self.report_period,
+            "basis": self.basis.value,
+            "groups": list(self.groups),
+            "observation_ids": list(self.observation_ids),
+            "group_totals": dict(self.group_totals),
+            "claimed_total": self.claimed_total,
+            "claimed_at": self.claimed_at,
+            "sequence": self.sequence,
+            "status": self.status,
+            "revalidated": self.revalidated,
+            "conflict": self.conflict,
+            "conflict_note": self.conflict_note,
+            "delivered_report_id": self.delivered_report_id,
+            "delivered_credential_id": self.delivered_credential_id,
+            "delivered_total": self.delivered_total,
+        }
+
+
+@dataclass(frozen=True)
+class PublishCredential:
+    """报告发布凭证：历史结果可凭它反查报告采用的观察值和撤回范围。"""
+
+    credential_id: str
+    report_id: str
+    comparison_id: str
+    report_period: str
+    digest: str
+    issued_at: str
+    total: float
+    observation_ids: tuple[str, ...]
+    basis: ComparisonEligibilityBasis
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "credential_id": self.credential_id,
+            "report_id": self.report_id,
+            "comparison_id": self.comparison_id,
+            "report_period": self.report_period,
+            "digest": self.digest,
+            "issued_at": self.issued_at,
+            "total": self.total,
+            "observation_ids": list(self.observation_ids),
+            "basis": self.basis.value,
+        }
+
+
+@dataclass
+class ComparisonReport:
+    """对比报告：实际采用的观察值、核对记录和发布凭证。"""
+
+    report_id: str
+    comparison_id: str
+    report_period: str
+    basis: ComparisonEligibilityBasis
+    claim_id: str = ""
+    used_observation_ids: tuple[str, ...] = ()
+    excluded_observation_ids: tuple[str, ...] = ()
+    group_totals: dict[str, float] = field(default_factory=dict)
+    group_means: dict[str, float] = field(default_factory=dict)
+    group_counts: dict[str, int] = field(default_factory=dict)
+    total: float = 0.0
+    total_n: int = 0
+    control_mean: float | None = None
+    treatment_mean: float | None = None
+    lift: float | None = None
+    p_value: float | None = None
+    significant: bool | None = None
+    eligibility_notes: list[str] = field(default_factory=list)
+    reconciliation: list[dict[str, Any]] = field(default_factory=list)
+    withdraw_scope_ids: tuple[str, ...] = ()
+    claim_total_at_claim: float | None = None
+    conflict: bool = False
+    conflict_note: str = ""
+    status: str = "已发布"
+    version: int = 1
+    created_at: str = ""
+    credential: PublishCredential | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "report_id": self.report_id,
+            "comparison_id": self.comparison_id,
+            "report_period": self.report_period,
+            "basis": self.basis.value,
+            "claim_id": self.claim_id,
+            "used_observation_ids": list(self.used_observation_ids),
+            "excluded_observation_ids": list(self.excluded_observation_ids),
+            "group_totals": dict(self.group_totals),
+            "group_means": dict(self.group_means),
+            "group_counts": dict(self.group_counts),
+            "total": self.total,
+            "total_n": self.total_n,
+            "control_mean": self.control_mean,
+            "treatment_mean": self.treatment_mean,
+            "lift": self.lift,
+            "p_value": self.p_value,
+            "significant": self.significant,
+            "eligibility_notes": list(self.eligibility_notes),
+            "reconciliation": [dict(item) for item in self.reconciliation],
+            "withdraw_scope_ids": list(self.withdraw_scope_ids),
+            "claim_total_at_claim": self.claim_total_at_claim,
+            "conflict": self.conflict,
+            "conflict_note": self.conflict_note,
+            "status": self.status,
+            "version": self.version,
+            "created_at": self.created_at,
+            "credential": self.credential.to_dict() if self.credential else None,
+        }
+
 
 
 # ============================================================
